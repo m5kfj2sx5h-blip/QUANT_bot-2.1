@@ -17,12 +17,15 @@ import traceback
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 
-# Import your custom modules
+# Add these two lines at the TOP of system_orchestrator.py
+from dotenv import load_dotenv
+load_dotenv()  # Loads variables from .env into os.environ
+
+# FIX 1: Import stable modules (CORRECTED)
 from data_feed import DataFeed
-from market_context import MarketContext
+from market_context import MarketContext, ArbitrageAnalyzer  # Both from same module
 from order_executor import OrderExecutor
-from monitoring import SystemMonitor
-from market_context import ArbitrageAnalyzer
+from health_monitor import HealthMonitor  # CHANGED: Use health_monitor instead of monitoring
 from exchange_wrappers import ExchangeWrapperFactory
 
 class SystemOrchestrator:
@@ -38,13 +41,13 @@ class SystemOrchestrator:
         self._setup_logging()
         self.logger = logging.getLogger("ArbitrageBot.Orchestrator")
         
-        # Core components
+        # FIX 2: Correct component initialization
         self.data_feed = None
         self.exchange_wrappers: Dict[str, Any] = {}
-        self.market_context = None
-        self.market_context = None
+        self.market_context = None  # Single declaration
+        self.arbitrage_analyzer = None  # Separate analyzer
         self.order_executor = None
-        self.monitoring = None
+        self.health_monitor = None  # CHANGED: Use health_monitor
         
         # State management
         self.running = False
@@ -62,12 +65,18 @@ class SystemOrchestrator:
         self.cycle_times = []
         self.latency_mode = "unknown"
         self.consecutive_failures = 0
-        
+    
     def _load_config(self) -> Dict[str, Any]:
         """Load configuration from JSON file."""
         try:
             with open(self.config_path, 'r') as f:
                 config = json.load(f)
+            
+            # VERIFY config has correct structure
+            exchanges = config.get('exchanges', {})
+            if isinstance(exchanges, list):
+                raise ValueError("Configuration error: 'exchanges' must be a dictionary, not a list")
+            
             self._log(f"✅ Configuration loaded from {self.config_path}")
             return config
         except Exception as e:
@@ -107,7 +116,7 @@ class SystemOrchestrator:
         self.data_feed = DataFeed(self.config, self.logger)
         self.logger.info("✅ Unified DataFeed initialized")
         
-        # Initialize exchange wrappers - FIXED SECTION
+        # Initialize exchange wrappers - CORRECTED SECTION
         exchange_configs = self.config.get('exchanges', {})
         global_exchange_settings = self.config.get('exchange_settings', {})
         
@@ -134,11 +143,11 @@ class SystemOrchestrator:
                     wrapper_config = {
                         'api_key': api_key,
                         'api_secret': api_secret,
-                        # Merge global settings
+                        **exchange_config,  # Include exchange-specific settings
                         **global_exchange_settings
                     }
                     
-                    # Call factory with correct two arguments
+                    # FIX 3: Correct factory call - TWO arguments only
                     wrapper = ExchangeWrapperFactory.create_wrapper(exchange_id, wrapper_config)
                     
                     if wrapper:
@@ -149,24 +158,28 @@ class SystemOrchestrator:
                         
                 except Exception as e:
                     self.logger.error(f"❌ Failed to initialize {exchange_id}: {e}")
+                    traceback.print_exc()
         
         if not self.exchange_wrappers:
             self.logger.error("❌ No exchanges initialized. Check configuration.")
             sys.exit(1)
         
-        # Initialize Market Context
+        # FIX 4: Initialize Market Context and Arbitrage Analyzer separately
         self.market_context = MarketContext(self.config, self.logger)
+        self.logger.info("✅ Market Context initialized")
         
-        # Initialize Arbitrage Analyzer
-        self.market_context = ArbitrageAnalyzer(
-            self.market_context.get_context(), self.config, self.logger
-        )
+        # Get context for analyzer
+        context_data = self.market_context.get_context()
+        self.arbitrage_analyzer = ArbitrageAnalyzer(context_data, self.config, self.logger)
+        self.logger.info("✅ Arbitrage Analyzer initialized")
         
         # Initialize Order Executor
         self.order_executor = OrderExecutor(self.config, self.logger)
+        self.logger.info("✅ Order Executor initialized")
         
-        # Initialize System Monitor
-        self.monitoring = SystemMonitor(self.config, self.logger)
+        # FIX 5: Initialize Health Monitor (not SystemMonitor)
+        self.health_monitor = HealthMonitor(self.config, self.logger)
+        self.logger.info("✅ Health Monitor initialized")
         
         # Initialize latency mode
         self._initialize_latency_mode()
@@ -175,8 +188,18 @@ class SystemOrchestrator:
     
     def _initialize_latency_mode(self):
         """Determine initial latency mode based on configuration."""
-        # Simplified logic - you can expand this
-        self.latency_mode = "high_latency"  # Default
+        # Check if we have WebSocket support
+        has_websocket = False
+        for exchange_id, wrapper in self.exchange_wrappers.items():
+            if hasattr(wrapper, 'use_websocket') and wrapper.use_websocket:
+                has_websocket = True
+                break
+        
+        if has_websocket and len(self.exchange_wrappers) <= 3:
+            self.latency_mode = "low_latency"
+        else:
+            self.latency_mode = "high_latency"
+        
         self.logger.info(f"📡 Latency mode: {self.latency_mode}")
     
     def _update_capital_mode(self):
@@ -187,16 +210,28 @@ class SystemOrchestrator:
             total_balance = 0.0
             
             for exchange_id, wrapper in self.exchange_wrappers.items():
-                balance_data = wrapper.get_balance()
-                if balance_data and 'total' in balance_data:
-                    # Extract USD equivalent - you may need to adjust this based on your wrapper
-                    usd_balance = balance_data['total'].get('USD', 0.0)
-                    if usd_balance == 0:
-                        # Try USDT if USD is 0
-                        usd_balance = balance_data['total'].get('USDT', 0.0)
+                try:
+                    # Use the correct method based on wrapper interface
+                    if hasattr(wrapper, 'get_balance'):
+                        balance_data = wrapper.get_balance()
+                    elif hasattr(wrapper, 'fetch_balance'):
+                        balance_data = wrapper.fetch_balance()
+                    else:
+                        self.logger.warning(f"⚠️  No balance method found for {exchange_id}")
+                        continue
                     
-                    balances[exchange_id] = usd_balance
-                    total_balance += usd_balance
+                    # Extract USD equivalent
+                    if balance_data and 'total' in balance_data:
+                        usd_balance = balance_data['total'].get('USD', 0.0)
+                        if usd_balance == 0:
+                            usd_balance = balance_data['total'].get('USDT', 0.0)
+                        
+                        balances[exchange_id] = usd_balance
+                        total_balance += usd_balance
+                        self.logger.debug(f"  {exchange_id} balance: ${usd_balance:.2f}")
+                    
+                except Exception as e:
+                    self.logger.error(f"❌ Error getting balance from {exchange_id}: {e}")
             
             if not balances:
                 self.logger.warning("⚠️  No balance data available")
@@ -248,6 +283,9 @@ class SystemOrchestrator:
             self.logger.info("🚀 Arbitrage Bot Started Successfully!")
             self.logger.info("=" * 60)
             
+            # FIX 6: Integrate dynamic position sizing
+            self._integrate_dynamic_position_sizing()
+            
             while self.running:
                 try:
                     cycle_start = time.time()
@@ -270,6 +308,7 @@ class SystemOrchestrator:
                     break
                 except Exception as e:
                     self.logger.error(f"❌ Error in main loop: {e}")
+                    traceback.print_exc()
                     self.consecutive_failures += 1
                     
                     if self.consecutive_failures > self.settings.get('max_consecutive_failures', 5):
@@ -283,55 +322,111 @@ class SystemOrchestrator:
             
         except Exception as e:
             self.logger.error(f"❌ Fatal error in main loop: {e}")
+            traceback.print_exc()
         
         finally:
             self.shutdown()
+    
+    def _integrate_dynamic_position_sizing(self):
+        """Integrate the dynamic position sizing from market_context."""
+        try:
+            # Check if dynamic position sizing is available
+            if hasattr(self.market_context, 'calculate_dynamic_position_size'):
+                self.logger.info("✅ Dynamic position sizing available")
+                self.use_dynamic_sizing = True
+                
+                # Update settings with dynamic parameters
+                if hasattr(self.market_context, 'get_dynamic_parameters'):
+                    dynamic_params = self.market_context.get_dynamic_parameters()
+                    self.settings.update(dynamic_params)
+                    self.logger.info(f"📊 Updated with dynamic parameters: {dynamic_params}")
+            else:
+                self.logger.warning("⚠️  Dynamic position sizing not available, using static")
+                self.use_dynamic_sizing = False
+                
+        except Exception as e:
+            self.logger.error(f"❌ Failed to integrate dynamic position sizing: {e}")
+            self.use_dynamic_sizing = False
     
     def _execute_trading_cycle(self):
         """Execute a single trading cycle."""
         self.trade_cycles += 1
         
         try:
-            # Update market data
+            # Step 1: Check system health
+            if not self.health_monitor.check_system_health():
+                self.logger.error("❌ System health check failed")
+                self.consecutive_failures += 1
+                return
+            
+            # Step 2: Update market data
             market_data = self.data_feed.get_market_data()
             if not market_data:
                 self.logger.warning("⚠️  No market data available")
                 return
             
-            # Update market context
+            # Step 3: Update market context with new data
             self.market_context.update(market_data)
             
-            # Update capital mode based on current balances
+            # Step 4: Update capital mode based on current balances
             self._update_capital_mode()
             
-            # Skip if no capital available
+            # Step 5: Skip if no capital available
             if self.available_capital_usd < self.settings['min_position_size_usd']:
                 self.logger.warning(f"⚠️  Insufficient capital: ${self.available_capital_usd:.2f}")
                 return
             
-            # Find arbitrage opportunities
-            opportunities = self.market_context.find_opportunities(
+            # Step 6: Find arbitrage opportunities
+            opportunities = self.arbitrage_analyzer.find_opportunities(
                 market_data, 
                 self.available_capital_usd
             )
             
             if not opportunities:
-                # Log every 10 cycles to avoid spam
                 if self.trade_cycles % 10 == 0:
                     self.logger.info("🔍 No arbitrage opportunities found")
                 return
             
-            # Sort by profit potential
+            # Step 7: Sort by profit potential
             opportunities.sort(key=lambda x: x.get('expected_profit_usd', 0), reverse=True)
             best_opportunity = opportunities[0]
             
-            # Check if profit meets threshold
+            # Step 8: Apply dynamic position sizing if available
+            if self.use_dynamic_sizing and 'exchange_id' in best_opportunity:
+                try:
+                    exchange_id = best_opportunity['exchange_id']
+                    # Get current inventory
+                    wrapper = self.exchange_wrappers.get(exchange_id)
+                    if wrapper and hasattr(wrapper, 'get_inventory'):
+                        current_inventory = wrapper.get_inventory()
+                        
+                        # Calculate dynamic position size
+                        dynamic_size = self.market_context.calculate_dynamic_position_size(
+                            exchange_id=exchange_id,
+                            current_inventory=current_inventory,
+                            market_data=market_data,
+                            config=self.config
+                        )
+                        
+                        # Update the opportunity with dynamic size
+                        if isinstance(dynamic_size, (int, float)) and dynamic_size > 0:
+                            best_opportunity['position_size'] = min(
+                                dynamic_size,
+                                self.available_capital_usd
+                            )
+                            self.logger.info(f"📈 Dynamic position size: ${dynamic_size:.2f}")
+                except Exception as e:
+                    self.logger.warning(f"⚠️  Dynamic sizing failed, using static: {e}")
+            
+            # Step 9: Check if profit meets threshold
             min_profit = self.settings['min_profit_threshold']
-            if best_opportunity.get('expected_profit_usd', 0) < min_profit:
-                self.logger.info(f"📊 Best opportunity (${best_opportunity['expected_profit_usd']:.2f}) below threshold (${min_profit:.2f})")
+            expected_profit = best_opportunity.get('expected_profit_usd', 0)
+            
+            if expected_profit < min_profit:
+                self.logger.info(f"📊 Best opportunity (${expected_profit:.2f}) below threshold (${min_profit:.2f})")
                 return
             
-            # Execute the trade
+            # Step 10: Execute the trade
             self.logger.info(f"🎯 Executing trade: {best_opportunity.get('description', 'N/A')}")
             
             result = self.order_executor.execute_arbitrage(
@@ -348,19 +443,16 @@ class SystemOrchestrator:
                 
                 self.logger.info(f"✅ Trade successful! Profit: ${profit:.2f}")
                 self.logger.info(f"📈 Total Profit: ${self.current_profit:.2f}")
+                
+                # Update health monitor with success
+                self.health_monitor.update_trade_success(profit)
             else:
                 self.failed_trades += 1
-                self.logger.error(f"❌ Trade failed: {result.get('error', 'Unknown error')}")
-            
-            # Update system monitor
-            self.monitoring.update_metrics({
-                'trade_cycles': self.trade_cycles,
-                'successful_trades': self.successful_trades,
-                'failed_trades': self.failed_trades,
-                'current_profit': self.current_profit,
-                'capital_mode': self.capital_mode,
-                'available_capital_usd': self.available_capital_usd
-            })
+                error_msg = result.get('error', 'Unknown error')
+                self.logger.error(f"❌ Trade failed: {error_msg}")
+                
+                # Update health monitor with failure
+                self.health_monitor.update_trade_failure(error_msg)
             
             # Log every 10 cycles
             if self.trade_cycles % 10 == 0:
@@ -368,11 +460,15 @@ class SystemOrchestrator:
             
         except Exception as e:
             self.logger.error(f"❌ Error in trading cycle: {e}")
+            traceback.print_exc()
             self.failed_trades += 1
     
     def _log_cycle_summary(self):
         """Log a summary of recent performance."""
-        avg_cycle_time = sum(self.cycle_times) / len(self.cycle_times) if self.cycle_times else 0
+        if not self.cycle_times:
+            return
+            
+        avg_cycle_time = sum(self.cycle_times) / len(self.cycle_times)
         
         self.logger.info("=" * 50)
         self.logger.info(f"📊 Cycle {self.trade_cycles} Summary:")
@@ -382,6 +478,8 @@ class SystemOrchestrator:
         self.logger.info(f"   Capital Mode: {self.capital_mode}")
         self.logger.info(f"   Available Capital: ${self.available_capital_usd:.2f}")
         self.logger.info(f"   Avg Cycle Time: {avg_cycle_time:.2f}s")
+        self.logger.info(f"   Latency Mode: {self.latency_mode}")
+        self.logger.info(f"   Dynamic Sizing: {'Enabled' if self.use_dynamic_sizing else 'Disabled'}")
         self.logger.info("=" * 50)
     
     def _setup_signal_handlers(self):
@@ -402,18 +500,23 @@ class SystemOrchestrator:
         # Stop data feed
         if self.data_feed:
             self.logger.info("🛑 Stopping DataFeed")
-            self.data_feed.stop()
-            self.logger.info("✅ Data feed stopped")
+            try:
+                self.data_feed.stop()
+                self.logger.info("✅ Data feed stopped")
+            except Exception as e:
+                self.logger.error(f"❌ Error stopping data feed: {e}")
         
         # Close exchange connections
         for exchange_id, wrapper in self.exchange_wrappers.items():
             try:
-                # If your wrapper has a close/disconnect method
                 if hasattr(wrapper, 'disconnect'):
                     wrapper.disconnect()
                     self.logger.info(f"✅ {exchange_id} disconnected")
-            except:
-                pass
+                elif hasattr(wrapper, 'close'):
+                    wrapper.close()
+                    self.logger.info(f"✅ {exchange_id} closed")
+            except Exception as e:
+                self.logger.error(f"❌ Error disconnecting {exchange_id}: {e}")
         
         # Log session summary
         self._log_session_summary()
@@ -430,6 +533,8 @@ class SystemOrchestrator:
             hours, remainder = divmod(session_duration.total_seconds(), 3600)
             minutes, seconds = divmod(remainder, 60)
             
+            success_rate = (self.successful_trades / self.trade_cycles * 100) if self.trade_cycles > 0 else 0
+            
             self.logger.info("=" * 70)
             self.logger.info("📊 ARBITRAGE BOT SESSION SUMMARY")
             self.logger.info("=" * 70)
@@ -437,10 +542,13 @@ class SystemOrchestrator:
             self.logger.info(f"🔁 Total Trade Cycles: {self.trade_cycles}")
             self.logger.info(f"✅ Successful Trades: {self.successful_trades}")
             self.logger.info(f"❌ Failed Trades: {self.failed_trades}")
-            self.logger.info(f"📈 Current Profit: ${self.current_profit:.2f}")
-            self.logger.info(f"💰 Estimated Balance: ${self.estimated_balance:.2f}")
+            self.logger.info(f"📈 Success Rate: {success_rate:.1f}%")
+            self.logger.info(f"💰 Total Profit: ${self.current_profit:.2f}")
+            self.logger.info(f"🏦 Estimated Balance: ${self.estimated_balance:.2f}")
             self.logger.info(f"🔧 Capital Mode: {self.capital_mode}")
             self.logger.info(f"💵 Available Capital: ${self.available_capital_usd:.2f}")
+            self.logger.info(f"⚡ Latency Mode: {self.latency_mode}")
+            self.logger.info(f"📊 Dynamic Sizing: {'Enabled' if getattr(self, 'use_dynamic_sizing', False) else 'Disabled'}")
             self.logger.info("=" * 70)
         except Exception as e:
             self.logger.error(f"Failed to log session summary: {e}")
