@@ -557,3 +557,75 @@ class DataFeed:
             self.logger.debug(f"Could not get last price for {symbol}: {e}")
         
         return 40000.0  # Conservative fallback
+    # === START OF ORCHESTRATOR COMPATIBILITY METHODS ===
+    def get_market_data(self):
+        """
+        COMPATIBILITY METHOD FOR system_orchestrator.py
+        Returns market data in format: {exchange_id: {symbol: {'bid': X, 'ask': Y, 'last': Z}}}
+        """
+        market_data = {}
+        
+        # Check if price_data exists and has the expected structure
+        if not hasattr(self, 'price_data') or not self.price_data:
+            self.logger.warning("No price_data available in DataFeed.")
+            return market_data
+        
+        try:
+            # Iterate through all symbols in price_data (e.g., 'BTC/USDT')
+            for symbol, exchange_dict in self.price_data.items():
+                # Iterate through all exchanges for this symbol
+                for exchange_id, price_info in exchange_dict.items():
+                    
+                    # Ensure the exchange entry exists in our result dict
+                    if exchange_id not in market_data:
+                        market_data[exchange_id] = {}
+                    
+                    # Extract bid, ask, last from the stored info.
+                    # Use .get() for safety, default to 0.0 if missing.
+                    bid = price_info.get('bid', 0.0)
+                    ask = price_info.get('ask', 0.0)
+                    last = price_info.get('last', 0.0)
+                    
+                    # If 'last' is missing, calculate a midpoint (common fallback)
+                    if last == 0.0 and bid > 0 and ask > 0:
+                        last = (bid + ask) / 2
+                    
+                    # Build the nested dictionary for this symbol on this exchange
+                    market_data[exchange_id][symbol] = {
+                        'bid': bid,
+                        'ask': ask,
+                        'last': last,
+                        'timestamp': price_info.get('timestamp', time.time())
+                    }
+            
+            self.logger.debug(f"Market data collected for {len(market_data)} exchanges.")
+            
+        except Exception as e:
+            self.logger.error(f"Error collecting market data: {e}")
+            # Return empty dict to prevent orchestrator crash
+            return {}
+        
+        return market_data
+
+    def stop(self):
+        """
+        COMPATIBILITY METHOD FOR system_orchestrator.py
+        Synchronous wrapper for the existing async stop() method.
+        Called by the orchestrator on shutdown.
+        """
+        self.logger.info("DataFeed.stop() compatibility method called")
+        # Call the existing async method synchronously
+        # This prevents the "coroutine never awaited" warning
+        try:
+            # Run the async stop method in the current event loop
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # If loop is running, schedule the async stop
+                asyncio.create_task(self.stop())
+            else:
+                # If no loop is running, run it synchronously
+                loop.run_until_complete(self.stop())
+        except Exception as e:
+            self.logger.error(f"Error in stop() compatibility wrapper: {e}")
+        return
+    # === END OF ORCHESTRATOR COMPATIBILITY METHODS ===
