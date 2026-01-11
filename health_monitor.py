@@ -14,824 +14,410 @@ Features:
 - Self-healing recommendations
 """
 
-import os
-import time
-import logging
-import psutil
-import asyncio
-from collections import deque, defaultdict
-from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Optional, Deque
-from enum import Enum
-from datetime import datetime, timedelta
-import statistics
 import json
-
-logger = logging.getLogger(__name__)
+import logging
+import time
+import os
+import psutil
+import statistics
+from datetime import datetime, timedelta
+from typing import Dict, List, Any, Optional, Tuple
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
+from enum import Enum
 
 class HealthStatus(Enum):
-    """System health status levels"""
-    OPTIMAL = "OPTIMAL"          # All systems functioning perfectly
-    HEALTHY = "HEALTHY"          # Minor issues, system functional
-    DEGRADED = "DEGRADED"        # Performance issues detected
-    CRITICAL = "CRITICAL"        # Critical issues, intervention needed
-    FAILED = "FAILED"            # System failure
+    HEALTHY = "healthy"
+    DEGRADED = "degraded"
+    CRITICAL = "critical"
+
+class AlertLevel(Enum):
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
+    CRITICAL = "critical"
 
 @dataclass
-class SystemMetrics:
-    """Comprehensive system performance metrics"""
-    # Timing metrics
-    cycle_times: Deque[float] = field(default_factory=lambda: deque(maxlen=1000))
-    trade_execution_times: Deque[float] = field(default_factory=lambda: deque(maxlen=500))
-    api_response_times: Dict[str, Deque[float]] = field(default_factory=lambda: defaultdict(lambda: deque(maxlen=100)))
-    
-    # Error metrics
-    api_errors: Deque[Tuple[float, str, str]] = field(default_factory=lambda: deque(maxlen=1000))
-    trade_errors: Deque[Tuple[float, str, float]] = field(default_factory=lambda: deque(maxlen=500))
-    system_errors: Deque[Tuple[float, str]] = field(default_factory=lambda: deque(maxlen=200))
-    
-    # Success metrics
-    successful_trades: Deque[Tuple[float, float, float]] = field(default_factory=lambda: deque(maxlen=500))
-    api_successes: Deque[Tuple[float, str, float]] = field(default_factory=lambda: deque(maxlen=1000))
-    
-    # Network metrics
-    network_latencies: Deque[float] = field(default_factory=lambda: deque(maxlen=200))
-    exchange_latencies: Dict[str, Deque[float]] = field(default_factory=lambda: defaultdict(lambda: deque(maxlen=100)))
-    
-    # Resource metrics
-    memory_usage_mb: Deque[float] = field(default_factory=lambda: deque(maxlen=200))
-    cpu_percentages: Deque[float] = field(default_factory=lambda: deque(maxlen=200))
-    
-    # Quality metrics
-    fill_rates: Deque[float] = field(default_factory=lambda: deque(maxlen=200))
-    slippage_percentages: Deque[float] = field(default_factory=lambda: deque(maxlen=200))
-    profit_loss_ratios: Deque[float] = field(default_factory=lambda: deque(maxlen=200))
-    
-    def to_dict(self) -> Dict:
-        """Convert metrics to dictionary for reporting"""
-        current_time = time.time()
-        
-        # Calculate recent error rates (last 5 minutes)
-        recent_errors = [
-            e for e in self.api_errors 
-            if current_time - e[0] < 300
-        ]
-        
-        recent_trade_errors = [
-            e for e in self.trade_errors 
-            if current_time - e[0] < 300
-        ]
-        
-        # Calculate API success rate (last 15 minutes)
-        recent_api_calls = [
-            s for s in self.api_successes 
-            if current_time - s[0] < 900
-        ]
-        
-        api_success_rate = 0.0
-        if recent_api_calls:
-            success_count = len([s for s in recent_api_calls if s[2] < 1000])  # Response time < 1s
-            api_success_rate = success_count / len(recent_api_calls)
-        
-        # Calculate cycle time statistics
-        avg_cycle_time = 0.0
-        cycle_time_std = 0.0
-        if self.cycle_times:
-            avg_cycle_time = statistics.mean(self.cycle_times)
-            if len(self.cycle_times) > 1:
-                cycle_time_std = statistics.stdev(self.cycle_times)
-        
-        return {
-            'timestamp': current_time,
-            'cycle_time_ms': round(avg_cycle_time * 1000, 1),
-            'cycle_time_std_ms': round(cycle_time_std * 1000, 1),
-            'api_error_rate_5min': len(recent_errors) / 5.0 if recent_errors else 0.0,
-            'trade_error_rate_5min': len(recent_trade_errors) / 5.0,
-            'api_success_rate_15min': round(api_success_rate, 3),
-            'avg_trade_time_ms': round(statistics.mean(self.trade_execution_times) * 1000, 1) if self.trade_execution_times else 0.0,
-            'avg_network_latency_ms': round(statistics.mean(self.network_latencies) * 1000, 1) if self.network_latencies else 0.0,
-            'avg_fill_rate': round(statistics.mean(self.fill_rates), 3) if self.fill_rates else 1.0,
-            'avg_slippage_pct': round(statistics.mean(self.slippage_percentages), 3) if self.slippage_percentages else 0.0,
-            'memory_usage_mb': round(statistics.mean(self.memory_usage_mb), 1) if self.memory_usage_mb else 0.0,
-            'cpu_percentage': round(statistics.mean(self.cpu_percentages), 1) if self.cpu_percentages else 0.0,
-            'total_metrics_collected': {
-                'cycles': len(self.cycle_times),
-                'trades': len(self.trade_execution_times),
-                'api_calls': len(self.api_successes),
-                'errors': len(self.api_errors)
-            }
-        }
+class Alert:
+    level: AlertLevel
+    message: str
+    timestamp: float
+    source: str = ""
+    data: Dict[str, Any] = field(default_factory=dict)
 
 class HealthMonitor:
     """
-    COMPREHENSIVE HEALTH MONITORING SYSTEM
-    
-    Responsibilities:
-    1. Monitor system performance and detect anomalies
-    2. Optimize cycle times based on current conditions
-    3. Track API health and detect rate limiting
-    4. Monitor resource usage and detect leaks
-    5. Provide self-healing recommendations
-    6. Generate performance reports and alerts
+    Monitors overall system health including exchanges, network, and resources.
+    Provides adaptive recommendations for optimization.
     """
     
-    def __init__(self, window_size: int = 100, config_path: str = 'config/health_config.json'):
-        """Initialize health monitoring system"""
-        self.metrics = SystemMetrics()
-        self.window_size = window_size
-        self.config_path = config_path
-        
-        # Load configuration
-        self.config = self._load_config()
-        
-        # State tracking
-        self.current_mode = "HIGH_LATENCY"
-        self.health_status = HealthStatus.OPTIMAL
-        self.last_health_check = time.time()
-        self.last_metrics_report = time.time()
-        
-        # Alert thresholds
-        self.alert_thresholds = self.config.get('alert_thresholds', {})
-        
-        # Adaptive parameters
-        self.cycle_time_history = deque(maxlen=50)
-        self.mode_switch_history = deque(maxlen=20)
-        
-        # Resource monitoring
-        self.process = psutil.Process()
+    def __init__(self, config, logger=None):
+        """Initialize health monitor with configuration."""
+        self.config = self._load_config(config)
+        self.logger = logger or self._setup_monitoring_logger()
         self.start_time = time.time()
         
-        # Performance optimization
-        self.optimal_cycle_times = {
-            'HIGH_LATENCY': 5.0,
-            'LOW_LATENCY': 1.0
+        # Initialize monitoring state with proper data structures
+        self.api_errors = defaultdict(deque)
+        self.api_successes = defaultdict(deque)
+        self.latency_metrics = defaultdict(deque)
+        self.trade_executions = deque(maxlen=200)
+        self.resource_usage = deque(maxlen=500)
+        self.rebalance_suggestions = deque(maxlen=100)
+        self.active_alerts = deque(maxlen=50)
+        
+        # Performance tracking
+        self.cycle_times = deque(maxlen=100)
+        self.error_rates = defaultdict(float)
+        self.last_report_time = time.time()
+        
+        # Initialize default configuration
+        self.default_config = {
+            'health_check_interval': 300,
+            'metrics_report_interval': 60,
+            'detailed_report_interval': 3600,
+            'alert_on_api_error_rate': 0.3,
+            'alert_on_memory_growth_mb': 10,
+            'alert_on_high_cpu_percent': 80,
+            'alert_on_slow_cycle_time': 2.0,
+            'performance_sample_size': 100,
+            'telemetry_enabled': True
         }
         
-        # Initialize logging
-        self._setup_monitoring_logger()
-        
-        logger.info(f"✅ Health Monitor initialized (window_size={window_size})")
+        # Merge with provided config
+        self.monitoring_config = self._merge_configs(self.config)
+        self.logger.info(f"✅ Health Monitor initialized (window_size={self.monitoring_config['performance_sample_size']})")
     
-    def _load_config(self) -> Dict:
-        """Load health monitoring configuration"""
-        default_config = {
-            "alert_thresholds": {
-                "api_error_rate": 0.5,      # errors per minute
-                "memory_growth_mb": 10.0,    # MB per hour
-                "cpu_usage_percent": 80.0,   # sustained CPU usage
-                "cycle_time_increase": 2.0,  # 2x normal cycle time
-                "network_latency_ms": 500.0  # average network latency
-            },
-            "optimization": {
-                "min_cycle_time": 0.5,
-                "max_cycle_time": 30.0,
-                "adaptation_rate": 0.1,
-                "stability_samples": 10
-            },
-            "reporting": {
-                "metrics_interval": 60.0,
-                "health_check_interval": 300.0,
-                "detailed_report_interval": 3600.0
-            },
-            "recovery": {
-                "error_cooldown_seconds": 60.0,
-                "mode_switch_cooldown": 300.0,
-                "max_consecutive_errors": 5
-            }
-        }
-        
-        try:
-            if os.path.exists(self.config_path):
-                with open(self.config_path, 'r') as f:
-                    user_config = json.load(f)
-                    # Deep merge
-                    self._merge_configs(default_config, user_config)
-            
-            logger.debug(f"Health config loaded: {json.dumps(default_config, indent=2)}")
-            return default_config
-            
-        except Exception as e:
-            logger.warning(f"Health config load failed, using defaults: {e}")
-            return default_config
+    def _load_config(self, config):
+        """Load the health monitoring configuration from a file or dict."""
+        if isinstance(config, dict):
+            return config
+        elif isinstance(config, str):
+            try:
+                with open(config, 'r') as f:
+                    return json.load(f)
+            except Exception as e:
+                self.logger.warning(f"Health config load failed, using defaults: {e}")
+                return self.default_config
+        else:
+            self.logger.warning(f"Health config load failed, unexpected type {type(config)}, using defaults")
+            return self.default_config
     
-    def _merge_configs(self, base: Dict, update: Dict):
-        """Recursively merge configuration dictionaries"""
-        for key, value in update.items():
-            if key in base and isinstance(base[key], dict) and isinstance(value, dict):
-                self._merge_configs(base[key], value)
-            else:
-                base[key] = value
+    def _merge_configs(self, config: Dict) -> Dict:
+        """Merge default config with provided config."""
+        merged = self.default_config.copy()
+        if 'monitoring' in config:
+            merged.update(config['monitoring'])
+        return merged
     
     def _setup_monitoring_logger(self):
-        """Setup dedicated logger for monitoring events"""
-        # Create monitoring logs directory
-        os.makedirs('logs/monitoring', exist_ok=True)
-        
-        # Monitoring file handler
-        monitor_handler = logging.FileHandler(
-            'logs/monitoring/health_events.log',
-            encoding='utf-8'
-        )
-        monitor_handler.setLevel(logging.INFO)
-        
-        monitor_formatter = logging.Formatter(
-            '%(asctime)s.%(msecs)03d | %(levelname)s | %(message)s',
-            datefmt='%Y-%m-d %H:%M:%S'
-        )
-        monitor_handler.setFormatter(monitor_formatter)
-        
-        # Add handler to health monitor logger
-        self.monitor_logger = logging.getLogger('HealthMonitor')
-        self.monitor_logger.addHandler(monitor_handler)
-        self.monitor_logger.setLevel(logging.INFO)
+        """Setup dedicated logger for monitoring."""
+        logger = logging.getLogger('health_monitor')
+        if not logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter('%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s')
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
+            logger.setLevel(logging.INFO)
+        return logger
     
-    def adjust_cycle_time(self, last_cycle_time: float, current_mode: str, capital_mode: str = "BALANCED") -> float:
-        """
-        Dynamically adjust cycle time based on system performance
+    def adjust_cycle_time(self, current_cycle_time: float, mode: str = "high_latency") -> float:
+        """Dynamically adjust cycle time based on performance."""
+        self.cycle_times.append(current_cycle_time)
+        if len(self.cycle_times) > self.monitoring_config['performance_sample_size']:
+            self.cycle_times.popleft()
         
-        Args:
-            last_cycle_time: Time taken for the last cycle (seconds)
-            current_mode: Current bot mode (HIGH_LATENCY or LOW_LATENCY)
-            capital_mode: Capital allocation mode (BOTTLENECKED or BALANCED) from SystemOrchestrator
-        
-        Returns:
-            Adjusted sleep time for next cycle
-        """
-        self.current_mode = current_mode
-        
-        # Record cycle time
-        self.metrics.cycle_times.append(last_cycle_time)
-        self.cycle_time_history.append(last_cycle_time)
-        
-        # Calculate base sleep time based on mode
-        if current_mode == "LOW_LATENCY":
-            base_target = 1.0
-            max_cycle = 2.0
-        else:
-            base_target = 5.0
-            max_cycle = 10.0
-        
-        # Check for performance issues
-        if len(self.cycle_time_history) >= 10:
-            avg_recent = statistics.mean(list(self.cycle_time_history)[-10:])
-            
-            # If cycles are taking too long, increase sleep time
-            if avg_recent > max_cycle:
-                adjustment = min(5.0, avg_recent - max_cycle)
-                sleep_time = base_target + adjustment
-                self.monitor_logger.warning(
-                    f"⚠️ Cycle time {avg_recent:.1f}s > max {max_cycle}s, "
-                    f"increasing sleep to {sleep_time:.1f}s (Capital Mode: {capital_mode})"
-                )
-            else:
-                # Normal operation - use adaptive adjustment
-                sleep_time = self._calculate_adaptive_sleep(
-                    last_cycle_time, 
-                    base_target, 
-                    current_mode
-                )
-        else:
-            # Not enough data yet, use conservative values
-            sleep_time = base_target * 1.5
-        
-        # Apply limits
-        min_sleep = self.config['optimization']['min_cycle_time']
-        max_sleep = self.config['optimization']['max_cycle_time']
-        sleep_time = max(min_sleep, min(max_sleep, sleep_time))
-        
-        # Update optimal cycle times
-        self.optimal_cycle_times[current_mode] = sleep_time
-        
-        return sleep_time
+        return self._calculate_adaptive_sleep(current_cycle_time, mode)
     
-    def _calculate_adaptive_sleep(self, last_cycle_time: float, base_target: float, mode: str) -> float:
-        """
-        Calculate adaptive sleep time using PID-like control
+    def _calculate_adaptive_sleep(self, current_cycle_time: float, mode: str) -> float:
+        """Calculate adaptive sleep time based on current performance."""
+        base_delay = 2.0  # Default base delay
         
-        Args:
-            last_cycle_time: Last measured cycle time
-            base_target: Target cycle time for this mode
-            mode: Current operating mode
+        if mode == "low_latency" and current_cycle_time < 0.1:
+            return max(0.05, base_delay * 0.5)
+        elif current_cycle_time > 1.0:
+            return min(10.0, base_delay * 2)
         
-        Returns:
-            Adaptive sleep time
-        """
-        # Get adaptation parameters
-        adaptation_rate = self.config['optimization']['adaptation_rate']
-        
-        # Calculate error (difference from target)
-        error = last_cycle_time - base_target
-        
-        # Simple proportional control
-        adjustment = error * adaptation_rate
-        
-        # Apply adjustment to base target
-        sleep_time = base_target + adjustment
-        
-        # Log significant adjustments
-        if abs(adjustment) > base_target * 0.2:  # >20% adjustment
-            self.monitor_logger.info(
-                f"🔄 Cycle time adjustment: {last_cycle_time:.2f}s -> "
-                f"{sleep_time:.2f}s (error: {error:.2f}s)"
-            )
-        
-        return sleep_time
+        return base_delay
     
-    def log_api_error(self, exchange_name: str, error_type: str = "unknown", response_time: float = None):
-        """
-        Log API error with comprehensive tracking
+    def log_api_error(self, exchange_id: str, endpoint: str, error: str):
+        """Log an API error for an exchange."""
+        self.api_errors[exchange_id].append({
+            'timestamp': time.time(),
+            'endpoint': endpoint,
+            'error': error
+        })
         
-        Args:
-            exchange_name: Name of the exchange
-            error_type: Type of error (rate_limit, network, auth, etc.)
-            response_time: Response time if available
-        """
-        timestamp = time.time()
-        error_entry = (timestamp, exchange_name, error_type)
-        
-        self.metrics.api_errors.append(error_entry)
-        
-        # Calculate error rate for recent window
-        error_rate = self._calculate_error_rate(300)  # 5-minute window
-        
-        # Check if error rate exceeds threshold
-        threshold = self.alert_thresholds.get('api_error_rate', 0.5)
-        if error_rate > threshold:
-            self.monitor_logger.warning(
-                f"⚠️ High API error rate: {error_rate:.1f}/min "
-                f"(threshold: {threshold}/min)"
-            )
-            
-            # Update health status
-            if error_rate > threshold * 2:
-                self.health_status = HealthStatus.CRITICAL
-            else:
-                self.health_status = HealthStatus.DEGRADED
-        
-        # Log the error
-        logger.debug(f"API Error logged: {exchange_name} - {error_type}")
+        # Trim old errors
+        if len(self.api_errors[exchange_id]) > 100:
+            self.api_errors[exchange_id].popleft()
     
-    def log_api_success(self, exchange_name: str, response_time: float):
-        """
-        Log successful API call for performance tracking
-        
-        Args:
-            exchange_name: Name of the exchange
-            response_time: Response time in seconds
-        """
-        timestamp = time.time()
-        success_entry = (timestamp, exchange_name, response_time)
-        
-        self.metrics.api_successes.append(success_entry)
-        self.metrics.api_response_times[exchange_name].append(response_time)
-        
-        # Check for slow responses
-        slow_threshold = 1.0  # 1 second
-        if response_time > slow_threshold:
-            self.monitor_logger.info(
-                f"🐌 Slow API response: {exchange_name} - {response_time:.2f}s"
-            )
+    def log_api_success(self, exchange_id: str, endpoint: str, latency_ms: float):
+        """Log a successful API call."""
+        self.api_successes[exchange_id].append({
+            'timestamp': time.time(),
+            'endpoint': endpoint,
+            'latency_ms': latency_ms
+        })
     
-    def log_trade_execution(self, execution_time: float, success: bool, 
-                           profit: float = 0.0, slippage: float = 0.0):
-        """
-        Log trade execution for performance analysis
-        
-        Args:
-            execution_time: Time taken to execute trade
-            success: Whether trade was successful
-            profit: Profit from trade (if successful)
-            slippage: Slippage percentage
-        """
-        timestamp = time.time()
-        
-        # Record execution time
-        self.metrics.trade_execution_times.append(execution_time)
-        
-        if success:
-            # Successful trade
-            trade_entry = (timestamp, profit, slippage)
-            self.metrics.successful_trades.append(trade_entry)
-            self.metrics.slippage_percentages.append(slippage)
-            
-            # Calculate fill rate (assuming filled if successful)
-            self.metrics.fill_rates.append(1.0)
-            
-            # Log high slippage
-            if slippage > 0.001:  # >0.1% slippage
-                self.monitor_logger.info(
-                    f"📉 High slippage: {slippage:.3%} on profitable trade"
-                )
-                
-        else:
-            # Failed trade
-            error_entry = (timestamp, 'trade_failed', execution_time)
-            self.metrics.trade_errors.append(error_entry)
-            self.metrics.fill_rates.append(0.0)
-            
-            # Check for consecutive failures
-            recent_failures = [
-                e for e in self.metrics.trade_errors
-                if timestamp - e[0] < 300  # Last 5 minutes
-            ]
-            
-            max_consecutive = self.config['recovery']['max_consecutive_errors']
-            if len(recent_failures) >= max_consecutive:
-                self.monitor_logger.warning(
-                    f"🚨 {max_consecutive} consecutive trade failures"
-                )
-                self.health_status = HealthStatus.DEGRADED
+    def log_trade_execution(self, trade_details: Dict):
+        """Log trade execution details."""
+        self.trade_executions.append({
+            'timestamp': time.time(),
+            'details': trade_details
+        })
     
-    def log_network_latency(self, latency_ms: float):
-        """
-        Log network latency measurement
-        
-        Args:
-            latency_ms: Network latency in milliseconds
-        """
-        latency_seconds = latency_ms / 1000.0
-        self.metrics.network_latencies.append(latency_seconds)
-        
-        # Check against threshold
-        threshold_ms = self.alert_thresholds.get('network_latency_ms', 500.0)
-        if latency_ms > threshold_ms:
-            self.monitor_logger.warning(
-                f"🌐 High network latency: {latency_ms:.0f}ms "
-                f"(threshold: {threshold_ms}ms)"
-            )
+    def log_network_latency(self, source: str, target: str, latency_ms: float):
+        """Log network latency between points."""
+        key = f"{source}_{target}"
+        self.latency_metrics[key].append({
+            'timestamp': time.time(),
+            'latency_ms': latency_ms
+        })
     
-    def log_exchange_latency(self, exchange_name: str, latency_ms: float):
-        """
-        Log exchange-specific latency
-        
-        Args:
-            exchange_name: Name of the exchange
-            latency_ms: Latency to this exchange in milliseconds
-        """
-        latency_seconds = latency_ms / 1000.0
-        self.metrics.exchange_latencies[exchange_name].append(latency_seconds)
-        
-        # Log consistently high latency
-        if len(self.metrics.exchange_latencies[exchange_name]) >= 10:
-            recent_latencies = list(self.metrics.exchange_latencies[exchange_name])[-10:]
-            avg_latency = statistics.mean(recent_latencies) * 1000
-            
-            if avg_latency > 1000:  # >1 second average
-                self.monitor_logger.info(
-                    f"🐌 High average latency to {exchange_name}: {avg_latency:.0f}ms"
-                )
+    def log_exchange_latency(self, exchange_id: str, latency_ms: float):
+        """Log exchange-specific latency."""
+        self.log_network_latency('system', exchange_id, latency_ms)
     
-    def log_rebalance_suggestion(self, suggestion_details: Dict):
-        """
-        CENTRAL HOOK for rebalance alerts.
-        Called by the future RebalanceAlerter to log structured suggestions.
-        
-        Args:
-            suggestion_details: Dict with keys:
-                - message: Primary alert text
-                - action: e.g., 'TRANSFER_USDT'
-                - amount: Amount to transfer
-                - from_exchange: Source exchange
-                - to_exchange: Target exchange
-                - network: Suggested network
-                - fee_estimate: Estimated fee
-        """
-        self.monitor_logger.warning(
-            f"🔄 REBALANCE SUGGESTION: {suggestion_details.get('message', 'N/A')}"
-        )
-        # Future: Add structured logging to metrics
+    def log_rebalance_suggestion(self, suggestion: Dict):
+        """Log a rebalance suggestion."""
+        self.rebalance_suggestions.append({
+            'timestamp': time.time(),
+            'suggestion': suggestion
+        })
     
     def update_resource_usage(self):
-        """Update system resource usage metrics"""
-        try:
-            # Memory usage
-            memory_mb = self.process.memory_info().rss / 1024 / 1024
-            self.metrics.memory_usage_mb.append(memory_mb)
-            
-            # CPU usage
-            cpu_percent = self.process.cpu_percent(interval=0.1)
-            self.metrics.cpu_percentages.append(cpu_percent)
-            
-            # Check for memory leaks
-            if len(self.metrics.memory_usage_mb) >= 50:
-                recent_memory = list(self.metrics.memory_usage_mb)[-50:]
-                
-                # Calculate memory growth rate (MB per hour)
-                time_window = 300  # 5 minutes in data points
-                if len(recent_memory) >= time_window:
-                    memory_growth = recent_memory[-1] - recent_memory[-time_window]
-                    growth_per_hour = memory_growth * (3600 / (300 * 5))  # Convert to per hour
-                    
-                    threshold = self.alert_thresholds.get('memory_growth_mb', 10.0)
-                    if growth_per_hour > threshold:
-                        self.monitor_logger.warning(
-                            f"💾 Potential memory leak: {growth_per_hour:.1f}MB/hour "
-                            f"(threshold: {threshold}MB/hour)"
-                        )
-                        self.health_status = HealthStatus.DEGRADED
-            
-            # Check CPU usage
-            if len(self.metrics.cpu_percentages) >= 10:
-                recent_cpu = list(self.metrics.cpu_percentages)[-10:]
-                avg_cpu = statistics.mean(recent_cpu)
-                
-                threshold = self.alert_thresholds.get('cpu_usage_percent', 80.0)
-                if avg_cpu > threshold:
-                    self.monitor_logger.warning(
-                        f"🔥 High CPU usage: {avg_cpu:.1f}% "
-                        f"(threshold: {threshold}%)"
-                    )
-                    
-        except Exception as e:
-            logger.debug(f"Resource monitoring error: {e}")
+        """Update system resource usage metrics."""
+        self.resource_usage.append({
+            'timestamp': time.time(),
+            'cpu_percent': psutil.cpu_percent(interval=0.1),
+            'memory_mb': psutil.Process().memory_info().rss / 1024 / 1024,
+            'active_exchanges': len(self.api_successes)
+        })
     
-    def _calculate_error_rate(self, window_seconds: float = 300) -> float:
-        """
-        Calculate error rate for a given time window
+    def _calculate_error_rate(self, exchange_id: str) -> float:
+        """Calculate error rate for an exchange."""
+        if exchange_id not in self.api_errors:
+            return 0.0
         
-        Args:
-            window_seconds: Time window in seconds
+        # Calculate rates for last hour
+        cutoff = time.time() - 3600
+        recent_errors = sum(1 for e in self.api_errors[exchange_id] if e['timestamp'] > cutoff)
+        recent_successes = sum(1 for s in self.api_successes.get(exchange_id, []) if s['timestamp'] > cutoff)
         
-        Returns:
-            Error rate (errors per minute)
-        """
-        current_time = time.time()
-        cutoff = current_time - window_seconds
+        total_calls = recent_errors + recent_successes
+        if total_calls == 0:
+            return 0.0
         
-        # Count errors in window
-        error_count = sum(
-            1 for error in self.metrics.api_errors
-            if error[0] > cutoff
-        )
-        
-        # Convert to errors per minute
-        errors_per_minute = error_count / (window_seconds / 60)
-        
-        return errors_per_minute
+        return recent_errors / total_calls
     
-    def get_health_status(self) -> Dict:
-        """
-        Get comprehensive health status report
-        
-        Returns:
-            Dictionary with health status and metrics
-        """
-        current_time = time.time()
-        
-        # Update resource usage
-        self.update_resource_usage()
-        
-        # Check if health check is due
-        health_check_interval = self.config['reporting']['health_check_interval']
-        if current_time - self.last_health_check > health_check_interval:
-            self._perform_health_check()
-            self.last_health_check = current_time
-        
-        # Prepare status report
-        metrics_dict = self.metrics.to_dict()
-        
-        status_report = {
-            'timestamp': current_time,
-            'system_id': f"HM_{int(self.start_time)}",
-            'health_status': self.health_status.value,
-            'current_mode': self.current_mode,
-            'uptime_hours': (current_time - self.start_time) / 3600,
-            'optimal_cycle_times': self.optimal_cycle_times,
-            'metrics': metrics_dict,
-            'recommendations': self._generate_recommendations(),
-            'alerts': self._get_active_alerts()
+    def get_health_status(self) -> Dict[str, Any]:
+        """Get comprehensive health status of the system."""
+        health_status = {
+            'overall_health': HealthStatus.HEALTHY.value,
+            'exchanges': {},
+            'system_resources': {},
+            'performance_metrics': {},
+            'recommendations': [],
+            'active_alerts': list(self.active_alerts)
         }
         
-        return status_report
-    
-    def _perform_health_check(self):
-        """Perform comprehensive health check"""
-        self.monitor_logger.info("🏥 Performing comprehensive health check...")
-        
-        # Check various system aspects
-        checks = []
-        
-        # 1. Check error rates
-        error_rate = self._calculate_error_rate(300)
-        error_threshold = self.alert_thresholds.get('api_error_rate', 0.5)
-        checks.append(('API Error Rate', error_rate <= error_threshold, f"{error_rate:.2f}/min"))
-        
-        # 2. Check cycle time stability
-        if len(self.metrics.cycle_times) >= 20:
-            recent_cycles = list(self.metrics.cycle_times)[-20:]
-            cycle_std = statistics.stdev(recent_cycles) if len(recent_cycles) > 1 else 0
-            stable = cycle_std < (statistics.mean(recent_cycles) * 0.5)
-            checks.append(('Cycle Stability', stable, f"std: {cycle_std:.2f}s"))
-        
-        # 3. Check resource usage
-        if self.metrics.memory_usage_mb:
-            memory = list(self.metrics.memory_usage_mb)[-1]
-            memory_ok = memory < 500  # <500MB
-            checks.append(('Memory Usage', memory_ok, f"{memory:.1f}MB"))
-        
-        # 4. Check trade success rate
-        if self.metrics.successful_trades and self.metrics.trade_errors:
-            total_trades = len(self.metrics.successful_trades) + len(self.metrics.trade_errors)
-            success_rate = len(self.metrics.successful_trades) / total_trades
-            success_ok = success_rate > 0.7  # >70% success rate
-            checks.append(('Trade Success', success_ok, f"{success_rate:.1%}"))
-        
-        # Update health status based on checks
-        failed_checks = [c for c in checks if not c[1]]
-        
-        if not failed_checks:
-            self.health_status = HealthStatus.OPTIMAL
-        elif len(failed_checks) <= 2:
-            self.health_status = HealthStatus.HEALTHY
-        elif len(failed_checks) <= 4:
-            self.health_status = HealthStatus.DEGRADED
-        else:
-            self.health_status = HealthStatus.CRITICAL
-        
-        # Log check results
-        self.monitor_logger.info(
-            f"Health Check: {self.health_status.value} | "
-            f"Failed: {len(failed_checks)}/{len(checks)}"
-        )
-        
-        for check in checks:
-            status = "✅" if check[1] else "❌"
-            self.monitor_logger.debug(f"  {status} {check[0]}: {check[2]}")
-    
-    def _generate_recommendations(self) -> List[str]:
-        """Generate system optimization recommendations"""
-        recommendations = []
-        current_time = time.time()
-        
-        # Check for mode switch recommendation
-        if self.current_mode == "HIGH_LATENCY":
-            # Check if we should switch to low latency
-            if len(self.metrics.network_latencies) >= 10:
-                avg_latency = statistics.mean(list(self.metrics.network_latencies)[-10:]) * 1000
-                if avg_latency < 50:  # <50ms average latency
-                    # Check when we last switched modes
-                    if self.mode_switch_history:
-                        last_switch = self.mode_switch_history[-1]
-                        cooldown = self.config['recovery']['mode_switch_cooldown']
-                        if current_time - last_switch > cooldown:
-                            recommendations.append(
-                                f"Switch to LOW_LATENCY mode (avg latency: {avg_latency:.0f}ms)"
-                            )
-        
-        # Check for cycle time adjustment
-        if len(self.cycle_time_history) >= 20:
-            avg_cycle = statistics.mean(list(self.cycle_time_history)[-20:])
-            current_sleep = self.optimal_cycle_times.get(self.current_mode, 5.0)
+        # Check exchange health
+        for exchange_id in set(list(self.api_errors.keys()) + list(self.api_successes.keys())):
+            error_rate = self._calculate_error_rate(exchange_id)
             
-            if avg_cycle < current_sleep * 0.7:  # Cycles much faster than sleep time
+            if error_rate > self.monitoring_config['alert_on_api_error_rate']:
+                exchange_health = HealthStatus.CRITICAL.value
+                health_status['overall_health'] = HealthStatus.DEGRADED.value
+                self.active_alerts.append(Alert(
+                    level=AlertLevel.ERROR,
+                    message=f"High error rate on {exchange_id}: {error_rate:.1%}",
+                    timestamp=time.time(),
+                    source=exchange_id,
+                    data={'error_rate': error_rate}
+                ))
+            elif error_rate > 0.1:
+                exchange_health = HealthStatus.DEGRADED.value
+                health_status['overall_health'] = HealthStatus.DEGRADED.value
+            else:
+                exchange_health = HealthStatus.HEALTHY.value
+            
+            health_status['exchanges'][exchange_id] = {
+                'health': exchange_health,
+                'error_rate': error_rate,
+                'recent_errors': sum(1 for e in self.api_errors.get(exchange_id, []) if time.time() - e['timestamp'] < 300),
+                'recent_successes': sum(1 for s in self.api_successes.get(exchange_id, []) if time.time() - s['timestamp'] < 300)
+            }
+        
+        # Check system resources
+        if self.resource_usage:
+            latest = self.resource_usage[-1]
+            health_status['system_resources'] = {
+                'cpu_percent': latest['cpu_percent'],
+                'memory_mb': latest['memory_mb'],
+                'active_exchanges': latest['active_exchanges']
+            }
+            
+            if latest['cpu_percent'] > self.monitoring_config['alert_on_high_cpu_percent']:
+                health_status['overall_health'] = HealthStatus.DEGRADED.value
+                self.active_alerts.append(Alert(
+                    level=AlertLevel.WARNING,
+                    message=f"High CPU usage: {latest['cpu_percent']}%",
+                    timestamp=time.time(),
+                    source='system',
+                    data={'cpu_percent': latest['cpu_percent']}
+                ))
+            
+            if latest['memory_mb'] > 1024:  # 1GB threshold
+                health_status['overall_health'] = HealthStatus.DEGRADED.value
+        
+        # Performance metrics
+        if self.cycle_times:
+            cycle_times_list = list(self.cycle_times)
+            health_status['performance_metrics'] = {
+                'avg_cycle_time': statistics.mean(cycle_times_list) if cycle_times_list else 0,
+                'min_cycle_time': min(cycle_times_list) if cycle_times_list else 0,
+                'max_cycle_time': max(cycle_times_list) if cycle_times_list else 0,
+                'std_cycle_time': statistics.stdev(cycle_times_list) if len(cycle_times_list) > 1 else 0,
+                'sample_size': len(cycle_times_list)
+            }
+            
+            avg_cycle = health_status['performance_metrics']['avg_cycle_time']
+            if avg_cycle > self.monitoring_config['alert_on_slow_cycle_time']:
+                health_status['overall_health'] = HealthStatus.DEGRADED.value
+        
+        # Generate recommendations
+        health_status['recommendations'] = self._generate_recommendations(health_status)
+        
+        return health_status
+
+    def check_system_health(self):
+        """
+        COMPATIBILITY METHOD FOR system_orchestrator.py
+        Returns True if system is healthy, False otherwise.
+        Added to match the interface expected by the new orchestrator.
+        """
+        health_status = self.get_health_status()
+        # Return True only if overall health is 'healthy'
+        return health_status['overall_health'] == HealthStatus.HEALTHY.value
+    
+    def _perform_health_check(self) -> Dict[str, Any]:
+        """Perform detailed health check (used internally)."""
+        return self.get_health_status()
+    
+    def _generate_recommendations(self, health_status: Dict) -> List[str]:
+        """Generate recommendations based on health status."""
+        recommendations = []
+        
+        # Check for high error rates
+        for exchange_id, exchange_data in health_status['exchanges'].items():
+            if exchange_data['error_rate'] > 0.2:
                 recommendations.append(
-                    f"Decrease cycle sleep time (cycles: {avg_cycle:.1f}s, sleep: {current_sleep:.1f}s)"
-                )
-            elif avg_cycle > current_sleep * 1.3:  # Cycles slower than sleep time
-                recommendations.append(
-                    f"Increase cycle sleep time (cycles: {avg_cycle:.1f}s, sleep: {current_sleep:.1f}s)"
+                    f"High error rate on {exchange_id} ({exchange_data['error_rate']:.1%}). "
+                    f"Consider reducing trade frequency or investigating connectivity."
                 )
         
-        # Check for exchange issues
-        for exchange, latencies in self.metrics.exchange_latencies.items():
-            if len(latencies) >= 10:
-                avg_latency = statistics.mean(list(latencies)[-10:]) * 1000
-                if avg_latency > 2000:  # >2 seconds
-                    recommendations.append(
-                        f"Investigate {exchange} connectivity (avg latency: {avg_latency:.0f}ms)"
-                    )
+        # Check system resources
+        sys_resources = health_status.get('system_resources', {})
+        if sys_resources.get('cpu_percent', 0) > 70:
+            recommendations.append(
+                f"High CPU usage ({sys_resources['cpu_percent']}%). "
+                f"Consider increasing cycle delay or optimizing code."
+            )
+        
+        if sys_resources.get('memory_mb', 0) > 800:
+            recommendations.append(
+                f"High memory usage ({sys_resources['memory_mb']:.1f}MB). "
+                f"Consider clearing caches or reducing data retention."
+            )
+        
+        # Check performance
+        perf_metrics = health_status.get('performance_metrics', {})
+        if perf_metrics.get('avg_cycle_time', 0) > 1.5:
+            recommendations.append(
+                f"Slow cycle times ({perf_metrics['avg_cycle_time']:.2f}s). "
+                f"Consider optimizing data fetching or reducing exchange calls."
+            )
         
         return recommendations
     
-    def _get_active_alerts(self) -> List[Dict]:
-        """Get list of active alerts"""
-        alerts = []
-        current_time = time.time()
-        
-        # Check for high error rates (last 15 minutes)
-        error_rate = self._calculate_error_rate(900)  # 15 minutes
-        if error_rate > self.alert_thresholds.get('api_error_rate', 0.5):
-            alerts.append({
-                'type': 'HIGH_ERROR_RATE',
-                'severity': 'WARNING' if error_rate < 2.0 else 'CRITICAL',
-                'message': f'API error rate: {error_rate:.1f}/min',
-                'timestamp': current_time
-            })
-        
-        # Check for memory growth
-        if len(self.metrics.memory_usage_mb) >= 100:
-            recent_memory = list(self.metrics.memory_usage_mb)[-100:]
-            memory_growth = recent_memory[-1] - recent_memory[0]
-            
-            growth_per_hour = memory_growth * (3600 / (100 * 5))  # Assuming 5s cycles
-            
-            threshold = self.alert_thresholds.get('memory_growth_mb', 10.0)
-            if growth_per_hour > threshold:
-                alerts.append({
-                    'type': 'MEMORY_LEAK_SUSPECTED',
-                    'severity': 'WARNING',
-                    'message': f'Memory growth: {growth_per_hour:.1f}MB/hour',
-                    'timestamp': current_time
-                })
-        
-        # Check for consecutive trade failures
-        if self.metrics.trade_errors:
-            recent_failures = [
-                e for e in self.metrics.trade_errors
-                if current_time - e[0] < 300  # Last 5 minutes
-            ]
-            
-            max_consecutive = self.config['recovery']['max_consecutive_errors']
-            if len(recent_failures) >= max_consecutive:
-                alerts.append({
-                    'type': 'CONSECUTIVE_TRADE_FAILURES',
-                    'severity': 'CRITICAL',
-                    'message': f'{len(recent_failures)} consecutive trade failures',
-                    'timestamp': current_time
-                })
-        
-        return alerts
+    def _get_active_alerts(self) -> List[Alert]:
+        """Get active alerts based on current state."""
+        return list(self.active_alerts)
     
-    def generate_report(self, detailed: bool = False) -> Dict:
-        """
-        Generate comprehensive health report
+    def generate_report(self, report_type: str = "summary") -> Dict[str, Any]:
+        """Generate a monitoring report."""
+        health_status = self.get_health_status()
         
-        Args:
-            detailed: Whether to include detailed metrics
+        report = {
+            'timestamp': time.time(),
+            'report_type': report_type,
+            'uptime_seconds': time.time() - self.start_time,
+            'health_status': health_status,
+            'active_alerts': [alert.__dict__ for alert in self.active_alerts],
+            'rebalance_suggestions': list(self.rebalance_suggestions)
+        }
         
-        Returns:
-            Health report dictionary
-        """
-        report = self.get_health_status()
-        
-        if detailed:
-            # Add detailed metrics
-            report['detailed_metrics'] = {
-                'cycle_time_distribution': self._get_distribution(self.metrics.cycle_times, 'seconds'),
-                'trade_time_distribution': self._get_distribution(self.metrics.trade_execution_times, 'seconds'),
-                'api_response_distribution': self._get_aggregated_distribution(self.metrics.api_response_times, 'seconds'),
-                'memory_usage_distribution': self._get_distribution(self.metrics.memory_usage_mb, 'MB'),
-                'exchange_latencies': {
-                    exchange: self._get_distribution(latencies, 'seconds')
-                    for exchange, latencies in self.metrics.exchange_latencies.items()
-                }
-            }
+        if report_type == "detailed":
+            report.update({
+                'api_errors_summary': {k: len(v) for k, v in self.api_errors.items()},
+                'latency_distribution': self._get_distribution(),
+                'resource_trend': list(self.resource_usage)[-20:] if self.resource_usage else []
+            })
         
         return report
     
-    def _get_distribution(self, data: Deque, unit: str) -> Dict:
-        """Calculate distribution statistics for a dataset"""
-        if not data:
-            return {}
+    def _get_distribution(self) -> Dict[str, List[float]]:
+        """Get latency distribution across all tracked paths."""
+        distribution = {}
+        for key, metrics in self.latency_metrics.items():
+            if metrics:
+                latencies = [m['latency_ms'] for m in metrics]
+                distribution[key] = [
+                    min(latencies) if latencies else 0,
+                    max(latencies) if latencies else 0,
+                    statistics.mean(latencies) if latencies else 0
+                ]
+        return distribution
+    
+    def _get_aggregated_distribution(self) -> Dict[str, float]:
+        """Get aggregated distribution statistics."""
+        all_latencies = []
+        for metrics in self.latency_metrics.values():
+            all_latencies.extend([m['latency_ms'] for m in metrics])
         
-        values = list(data)
+        if not all_latencies:
+            return {'min': 0, 'max': 0, 'avg': 0, 'p95': 0}
         
+        sorted_latencies = sorted(all_latencies)
         return {
-            'count': len(values),
-            'mean': round(statistics.mean(values), 3),
-            'median': round(statistics.median(values), 3),
-            'std': round(statistics.stdev(values) if len(values) > 1 else 0, 3),
-            'min': round(min(values), 3),
-            'max': round(max(values), 3),
-            'unit': unit
+            'min': sorted_latencies[0],
+            'max': sorted_latencies[-1],
+            'avg': statistics.mean(sorted_latencies),
+            'p95': sorted_latencies[int(len(sorted_latencies) * 0.95)]
         }
     
-    def _get_aggregated_distribution(self, data_dict: Dict[str, Deque], unit: str) -> Dict:
-        """Calculate aggregated distribution across multiple datasets"""
-        all_values = []
-        for values in data_dict.values():
-            all_values.extend(values)
-        
-        return self._get_distribution(deque(all_values), unit)
-    
-    def save_report(self, filepath: str = None):
-        """
-        Save health report to file
-        
-        Args:
-            filepath: Path to save report (defaults to timestamped file)
-        """
-        if filepath is None:
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            filepath = f'logs/monitoring/health_report_{timestamp}.json'
-        
-        report = self.generate_report(detailed=True)
-        
+    def save_report(self, filepath: str = "health_report.json"):
+        """Save current report to file."""
+        report = self.generate_report("detailed")
         try:
             with open(filepath, 'w') as f:
                 json.dump(report, f, indent=2, default=str)
-            
-            self.monitor_logger.info(f"📊 Health report saved to {filepath}")
-            
+            self.logger.info(f"Health report saved to {filepath}")
         except Exception as e:
-            logger.error(f"Failed to save health report: {e}")
+            self.logger.error(f"Failed to save health report: {e}")
 
-# Singleton instance for easy access
-_health_monitor_instance = None
 
-def get_health_monitor(window_size: int = 100) -> HealthMonitor:
-    """Get or create singleton health monitor instance"""
-    global _health_monitor_instance
-    if _health_monitor_instance is None:
-        _health_monitor_instance = HealthMonitor(window_size)
-    return _health_monitor_instance
+# Example usage
+if __name__ == "__main__":
+    # Test the health monitor
+    monitor = HealthMonitor({"monitoring": {"health_check_interval": 60}})
+    
+    # Simulate some metrics
+    monitor.log_api_success("binance", "ticker", 45.2)
+    monitor.log_api_error("kraken", "orderbook", "Timeout")
+    monitor.log_exchange_latency("coinbase", 120.5)
+    
+    # Generate report
+    report = monitor.generate_report()
+    print(json.dumps(report, indent=2))
